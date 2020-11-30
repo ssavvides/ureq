@@ -1,3 +1,4 @@
+#[cfg(not(target_env = "sgx"))]
 use log::debug;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
@@ -331,27 +332,7 @@ pub(crate) fn connect_https(unit: &Unit, hostname: &str) -> Result<Stream, Error
 }
 
 pub(crate) fn connect_host(unit: &Unit, hostname: &str, port: u16) -> Result<TcpStream, Error> {
-    let connect_deadline: Option<Instant> =
-        if let Some(timeout_connect) = unit.agent.config.timeout_connect {
-            Instant::now().checked_add(timeout_connect)
-        } else {
-            unit.deadline
-        };
     let proxy: Option<Proxy> = unit.agent.config.proxy.clone();
-    let netloc = match proxy {
-        Some(ref proxy) => format!("{}:{}", proxy.server, proxy.port),
-        None => format!("{}:{}", hostname, port),
-    };
-
-    // TODO: Find a way to apply deadline to DNS lookup.
-    let sock_addrs = unit
-        .resolver()
-        .resolve(&netloc)
-        .map_err(|e| ErrorKind::DnsFailed.new().src(e))?;
-
-    if sock_addrs.is_empty() {
-        return Err(ErrorKind::DnsFailed.msg(&format!("No ip address for {}", hostname)));
-    }
 
     let proto = if let Some(ref proxy) = proxy {
         Some(proxy.proto)
@@ -359,48 +340,77 @@ pub(crate) fn connect_host(unit: &Unit, hostname: &str, port: u16) -> Result<Tcp
         None
     };
 
-    let mut any_err = None;
-    let mut any_stream = None;
-    // Find the first sock_addr that accepts a connection
-    for sock_addr in sock_addrs {
-        // ensure connect timeout or overall timeout aren't yet hit.
-        let timeout = match connect_deadline {
-            Some(deadline) => Some(time_until_deadline(deadline)?),
-            None => None,
+    let mut stream;
+    #[cfg(not(target_env = "sgx"))] {
+        let connect_deadline: Option<Instant> =
+            if let Some(timeout_connect) = unit.agent.config.timeout_connect {
+                Instant::now().checked_add(timeout_connect)
+            } else {
+                unit.deadline
+            };
+
+        let netloc = match proxy {
+            Some(ref proxy) => format!("{}:{}", proxy.server, proxy.port),
+            None => format!("{}:{}", hostname, port),
         };
 
-        debug!("connecting to {}", &sock_addr);
-        // connect with a configured timeout.
-        let stream = if Some(Proto::SOCKS5) == proto {
-            connect_socks5(
-                &unit,
-                proxy.clone().unwrap(),
-                connect_deadline,
-                sock_addr,
-                hostname,
-                port,
-            )
-        } else if let Some(timeout) = timeout {
-            TcpStream::connect_timeout(&sock_addr, timeout)
-        } else {
-            TcpStream::connect(&sock_addr)
-        };
+        // TODO: Find a way to apply deadline to DNS lookup.
+        let sock_addrs = unit
+            .resolver()
+            .resolve(&netloc)
+            .map_err(|e| ErrorKind::DnsFailed.new().src(e))?;
 
-        if let Ok(stream) = stream {
-            any_stream = Some(stream);
-            break;
-        } else if let Err(err) = stream {
-            any_err = Some(err);
+        if sock_addrs.is_empty() {
+            return Err(ErrorKind::DnsFailed.msg(&format!("No ip address for {}", hostname)));
         }
+
+        let mut any_err = None;
+        let mut any_stream = None;
+        // Find the first sock_addr that accepts a connection
+        for sock_addr in sock_addrs {
+            // ensure connect timeout or overall timeout aren't yet hit.
+            let timeout = match connect_deadline {
+                Some(deadline) => Some(time_until_deadline(deadline)?),
+                None => None,
+            };
+
+            debug!("connecting to {}", &sock_addr);
+            // connect with a configured timeout.
+            let stream = if Some(Proto::SOCKS5) == proto {
+                connect_socks5(
+                    &unit,
+                    proxy.clone().unwrap(),
+                    connect_deadline,
+                    sock_addr,
+                    hostname,
+                    port,
+                )
+            } else if let Some(timeout) = timeout {
+                TcpStream::connect_timeout(&sock_addr, timeout)
+            } else {
+                TcpStream::connect(&sock_addr)
+            };
+
+            if let Ok(stream) = stream {
+                any_stream = Some(stream);
+                break;
+            } else if let Err(err) = stream {
+                any_err = Some(err);
+            }
+        }
+
+        stream = if let Some(stream) = any_stream {
+            stream
+        } else if let Some(e) = any_err {
+            return Err(ErrorKind::ConnectionFailed.msg("Connect error").src(e));
+        } else {
+            panic!("shouldn't happen: failed to connect to all IPs, but no error");
+        };
     }
 
-    let mut stream = if let Some(stream) = any_stream {
-        stream
-    } else if let Some(e) = any_err {
-        return Err(ErrorKind::ConnectionFailed.msg("Connect error").src(e));
-    } else {
-        panic!("shouldn't happen: failed to connect to all IPs, but no error");
-    };
+    #[cfg(target_env = "sgx")] {
+        stream = TcpStream::connect(format!("{}:{}", hostname, port))?;
+    }
 
     if let Some(deadline) = unit.deadline {
         stream.set_read_timeout(Some(time_until_deadline(deadline)?))?;
